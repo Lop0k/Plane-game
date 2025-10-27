@@ -1,0 +1,455 @@
+<!doctype html>
+<html>
+<head>
+  <meta charset="utf-8" />
+  <title>Dogfight — Clean Build</title>
+  <meta name="viewport" content="width=device-width,initial-scale=1" />
+  <style>
+    body { margin:0; background:#0b1220; color:#ddd; font-family:monospace; }
+    canvas { display:block; margin:0 auto; background:#08121a; }
+    #ui { text-align:center; padding:8px; }
+    #debug { position:fixed; left:8px; top:8px; color:#8f8; font-size:12px; }
+  </style>
+</head>
+<body>
+  <div id="ui">Press <b>1</b> (WASD+Space) or <b>2</b> (Arrows+Enter/Numpad0) to join. Game starts in <span id="count">5</span>s</div>
+  <canvas id="c" width="900" height="600"></canvas>
+  <div id="debug"></div>
+
+<script>
+/*
+  Cleaned, lint-friendly, robust single-file game demo.
+  Features:
+   - Local join for up to 2 players (Digit1/Digit2)
+   - Player controls: WASD + Space (player1) and Arrows + Enter/Numpad0 (player2)
+   - Per-plane shooter cooldown
+   - AI personalities (aggressive, evasive, passive, random)
+   - Solo fallback if nobody joins
+   - Defensive collision handling and no TDZ/order bugs
+*/
+
+/* ---------------------------
+   Basic utilities & global state
+   --------------------------- */
+const canvas = document.getElementById('c');
+const ctx = canvas.getContext('2d');
+const joinCountdownEl = document.getElementById('count');
+const debugEl = document.getElementById('debug');
+
+function now() { return performance.now(); }
+function clamp(v,a,b){ return Math.max(a, Math.min(b, v)); }
+function rand(a=0,b=1){ return a + Math.random()*(b-a); }
+function dist(a,b){ return Math.hypot((a.x - b.x),(a.y - b.y)); }
+function normalizeAngle(a){ return Math.atan2(Math.sin(a), Math.cos(a)); }
+
+/* Input key state */
+const KEY = {};
+window.addEventListener('keydown', (e) => {
+  KEY[e.code] = true;
+  // map Enter to Numpad0 (shoot alias) for player 2 convenience
+  if (e.code === 'Enter') KEY['Numpad0'] = true;
+});
+window.addEventListener('keyup', (e) => {
+  KEY[e.code] = false;
+  if (e.code === 'Enter') KEY['Numpad0'] = false;
+});
+
+/* ---------------------------
+   Entity containers (declared first)
+   --------------------------- */
+const planes = [];   // Plane instances
+const bullets = [];  // Bullet instances
+
+/* ---------------------------
+   Configs
+   --------------------------- */
+const JOIN_WINDOW_MS = 5000;
+const MAX_PLAYERS = 2;
+
+/* Personalities presets */
+const PERSONALITIES = [
+  { name:'aggressive', aggression:0.95, evasiveness:0.2, accuracy:0.75, curiosity:0.2, speedModifier:1.1 },
+  { name:'evasive',    aggression:0.45, evasiveness:0.95, accuracy:0.5,  curiosity:0.3, speedModifier:1.0 },
+  { name:'passive',    aggression:0.15, evasiveness:0.2,  accuracy:0.4,  curiosity:0.6, speedModifier:0.9 },
+  { name:'random',     aggression:0.6,  evasiveness:0.5,  accuracy:0.55, curiosity:0.8, speedModifier:1.0 }
+];
+
+/* Input maps for local players */
+const INPUTS = [
+  { forward:'KeyW', backward:'KeyS', left:'KeyA', right:'KeyD', shoot:'Space' },       // player 1
+  { forward:'ArrowUp', backward:'ArrowDown', left:'ArrowLeft', right:'ArrowRight', shoot:'Numpad0' } // player 2
+];
+
+/* ---------------------------
+   Classes
+   --------------------------- */
+
+class Bullet {
+  constructor(opts = {}) {
+    this.x = opts.x ?? 0;
+    this.y = opts.y ?? 0;
+    this.angle = opts.angle ?? 0;
+    this.speed = opts.speed ?? 6;
+    this.owner = opts.owner ?? null;
+    this.color = opts.color ?? '#fffa';
+    this.radius = opts.radius ?? 3;
+  }
+  update(dt) {
+    this.x += Math.cos(this.angle) * this.speed;
+    this.y += Math.sin(this.angle) * this.speed;
+  }
+  draw(ctx) {
+    ctx.beginPath();
+    ctx.fillStyle = this.color;
+    ctx.arc(this.x, this.y, this.radius, 0, Math.PI*2);
+    ctx.fill();
+  }
+}
+
+class Plane {
+  constructor(opts = {}) {
+    this.id = opts.id ?? Math.floor(Math.random()*999999);
+    this.x = opts.x ?? rand(100, canvas.width - 100);
+    this.y = opts.y ?? rand(60, canvas.height - 60);
+    this.angle = opts.angle ?? 0;
+    this.vx = 0;
+    this.vy = 0;
+    this.maxSpeed = opts.maxSpeed ?? 3.2;
+    this.color = opts.color ?? '#f5f5f5';
+    this.isPlayer = !!opts.isPlayer;
+    this.inputMap = opts.inputMap ?? null;
+    this.size = opts.size ?? 12;
+    this.health = opts.health ?? 100;
+
+    this.lastShotAt = -999999;
+    this.shootCooldownMs = opts.shootCooldownMs ?? 500;
+
+    this.personality = Object.assign({
+      name: 'neutral', aggression:0.5, evasiveness:0.5, accuracy:0.6, curiosity:0.3, speedModifier:1.0
+    }, opts.personality || {});
+  }
+
+  canShoot() {
+    return (now() - this.lastShotAt) >= this.shootCooldownMs;
+  }
+
+  shoot() {
+    if (!this.canShoot()) return false;
+    this.lastShotAt = now();
+    const b = new Bullet({
+      x: this.x + Math.cos(this.angle) * 18,
+      y: this.y + Math.sin(this.angle) * 18,
+      angle: this.angle,
+      speed: 7 + (this.personality.speedModifier || 1),
+      owner: this,
+      color: this.color
+    });
+    bullets.push(b);
+    return true;
+  }
+
+  update(dt, world) {
+    if (this.isPlayer && this.inputMap) {
+      this.updatePlayer(dt);
+    } else {
+      this.updateAI(dt, world);
+    }
+    // friction and clamp
+    this.vx *= 0.995;
+    this.vy *= 0.995;
+    const sp = Math.hypot(this.vx, this.vy);
+    const maxSp = this.maxSpeed * (this.personality.speedModifier || 1);
+    if (sp > maxSp) {
+      this.vx = this.vx / sp * maxSp;
+      this.vy = this.vy / sp * maxSp;
+    }
+    this.x += this.vx;
+    this.y += this.vy;
+    // bounds
+    this.x = clamp(this.x, 10, canvas.width - 10);
+    this.y = clamp(this.y, 10, canvas.height - 10);
+  }
+
+  updatePlayer(dt) {
+    const map = this.inputMap;
+    let thrust = 0;
+    if (KEY[map.forward]) thrust = 0.12;
+    if (KEY[map.backward]) thrust = -0.06;
+    if (KEY[map.left]) this.angle -= 0.06;
+    if (KEY[map.right]) this.angle += 0.06;
+
+    this.vx += Math.cos(this.angle) * thrust;
+    this.vy += Math.sin(this.angle) * thrust;
+
+    if (KEY[map.shoot]) this.shoot();
+  }
+
+  updateAI(dt, world) {
+    const p = this.personality;
+    // target selection
+    const others = world.planes.filter(pl => pl !== this);
+    let target = null;
+    if (others.length > 0) {
+      const humans = others.filter(x => x.isPlayer);
+      const pool = (humans.length && Math.random() < p.aggression) ? humans : others;
+      let best = null;
+      for (const pl of pool) {
+        const d = Math.hypot(pl.x - this.x, pl.y - this.y);
+        if (!best || d < best.d) best = { pl, d };
+      }
+      if (best) target = best.pl;
+    }
+
+    if (target) {
+      const dx = target.x - this.x;
+      const dy = target.y - this.y;
+      const angTo = Math.atan2(dy, dx);
+      const angleDiff = normalizeAngle(angTo - this.angle);
+      // rotate toward target with personality-influenced max turn
+      const turn = 0.03 + 0.02 * p.aggression;
+      this.angle += clamp(angleDiff, -turn, turn);
+
+      const distTo = Math.hypot(dx,dy);
+      let desiredSpeed = this.maxSpeed * (0.4 + p.aggression * 0.8) * (p.speedModifier || 1);
+      if (p.evasiveness > 0.6 && distTo < 150) desiredSpeed *= 0.6;
+
+      this.vx += Math.cos(this.angle) * 0.06 * (desiredSpeed / this.maxSpeed);
+      this.vy += Math.sin(this.angle) * 0.06 * (desiredSpeed / this.maxSpeed);
+
+      // shooting logic
+      if (this.canShoot()) {
+        const shootChance = (0.25 + p.aggression * 0.5) * p.accuracy;
+        if (Math.random() < shootChance) {
+          const jitter = (1 - p.accuracy) * 0.6;
+          const aimAngle = angTo + rand(-jitter, jitter);
+          // soft aim
+          this.angle = this.angle * 0.9 + aimAngle * 0.1;
+          this.shoot();
+        }
+      }
+    } else {
+      // no target: wander
+      if (Math.random() < p.curiosity * 0.01) this.angle += rand(-1,1) * 0.5;
+      this.vx += Math.cos(this.angle) * 0.02;
+      this.vy += Math.sin(this.angle) * 0.02;
+    }
+
+    // dodge bullets
+    const nearby = bullets.find(b => b.owner !== this && Math.hypot(b.x - this.x, b.y - this.y) < 120);
+    if (nearby && p.evasiveness > 0.3) {
+      const incomingAng = Math.atan2(nearby.y - this.y, nearby.x - this.x);
+      const dodgeDir = Math.sign(Math.sin(incomingAng - this.angle)) || 1;
+      this.angle += dodgeDir * 0.12 * p.evasiveness;
+      this.vx += Math.cos(this.angle + Math.PI/2) * 0.4 * p.evasiveness;
+      this.vy += Math.sin(this.angle + Math.PI/2) * 0.4 * p.evasiveness;
+    }
+  }
+
+  draw(ctx) {
+    ctx.save();
+    ctx.translate(this.x, this.y);
+    ctx.rotate(this.angle);
+    // body
+    ctx.fillStyle = this.color;
+    ctx.beginPath();
+    ctx.moveTo(14,0);
+    ctx.lineTo(-10,8);
+    ctx.lineTo(-6,0);
+    ctx.lineTo(-10,-8);
+    ctx.closePath();
+    ctx.fill();
+    // health bar
+    ctx.fillStyle = '#333';
+    ctx.fillRect(-12, -18, 24, 4);
+    ctx.fillStyle = '#0f0';
+    ctx.fillRect(-12, -18, 24 * clamp(this.health / 100, 0, 1), 4);
+    // tag (P for player, initial for AI)
+    ctx.fillStyle = '#fff';
+    ctx.font = '10px monospace';
+    if (this.isPlayer) ctx.fillText('P', 16, 0);
+    else ctx.fillText(this.personality.name[0]?.toUpperCase() ?? '?', 16, 0);
+    ctx.restore();
+  }
+}
+
+/* ---------------------------
+   Gameplay helpers
+   --------------------------- */
+
+function spawnAI(overrides = {}) {
+  const pset = PERSONALITIES[Math.floor(Math.random() * PERSONALITIES.length)];
+  const color = overrides.color ?? (Math.random() > 0.5 ? '#9f9' : '#ff9');
+  const plane = new Plane(Object.assign({
+    isPlayer: false,
+    color,
+    shootCooldownMs: 400 + Math.round(Math.random() * 300),
+    personality: Object.assign({}, pset)
+  }, overrides));
+  planes.push(plane);
+  return plane;
+}
+
+function tryJoin(slotIndex) {
+  if (slotIndex < 0 || slotIndex >= MAX_PLAYERS) return;
+  // check if already a human assigned to this input
+  const already = planes.find(p => p.isPlayer && p.inputMap === INPUTS[slotIndex]);
+  if (already) return;
+  const p = new Plane({
+    isPlayer: true,
+    inputMap: INPUTS[slotIndex],
+    color: slotIndex === 0 ? '#69c' : '#c66',
+    shootCooldownMs: 400,
+    personality: { name:'human', aggression:0.5, evasiveness:0.5, accuracy:0.8, curiosity:0.5 }
+  });
+  planes.push(p);
+  return p;
+}
+
+/* bind join keys (Digit1/Digit2) */
+window.addEventListener('keydown', (e) => {
+  if (e.code === 'Digit1') tryJoin(0);
+  if (e.code === 'Digit2') tryJoin(1);
+});
+
+/* ---------------------------
+   Join countdown and start logic
+   --------------------------- */
+let joinStart = now();
+let gameStarted = false;
+
+function finalizeJoinAndStart() {
+  const humanCount = planes.filter(p => p.isPlayer).length;
+  if (humanCount === 0) {
+    // solo fallback: give the user player1 control and spawn AI
+    tryJoin(0);
+    spawnAI({ color:'#ff6', personality: PERSONALITIES[0] });
+  } else {
+    const needed = Math.max(1, 2 - humanCount);
+    for (let i=0; i<needed; i++) spawnAI();
+  }
+  gameStarted = true;
+  document.getElementById('ui').textContent = 'Go!';
+}
+
+/* quick "start solo" with 'S' key */
+window.addEventListener('keydown', (e) => {
+  if (e.code === 'KeyS' && !gameStarted) {
+    finalizeJoinAndStart();
+    document.getElementById('ui').textContent = 'Solo start!';
+  }
+});
+
+/* ---------------------------
+   Game loop
+   --------------------------- */
+let lastTs = performance.now();
+
+function gameLoop(ts) {
+  const dt = (ts - lastTs) / 1000;
+  lastTs = ts;
+
+  // join countdown
+  if (!gameStarted) {
+    const elapsed = now() - joinStart;
+    const remaining = Math.max(0, Math.ceil((JOIN_WINDOW_MS - elapsed) / 1000));
+    joinCountdownEl.textContent = remaining;
+    if (elapsed >= JOIN_WINDOW_MS) finalizeJoinAndStart();
+  }
+
+  // update
+  for (let i = planes.length - 1; i >= 0; i--) {
+    const p = planes[i];
+    if (p) p.update(dt, { planes });
+  }
+  for (let i = bullets.length - 1; i >= 0; i--) {
+    const b = bullets[i];
+    if (b) b.update(dt);
+  }
+
+  // bullets bounds + bullet-plane collisions (safe loop)
+  for (let i = bullets.length - 1; i >= 0; i--) {
+    const b = bullets[i];
+    if (!b) continue;
+    // out of bounds removal
+    if (b.x < -20 || b.x > canvas.width + 20 || b.y < -20 || b.y > canvas.height + 20) {
+      bullets.splice(i, 1);
+      continue;
+    }
+    // check collision with planes
+    let collided = false;
+    for (let j = planes.length - 1; j >= 0; j--) {
+      const p = planes[j];
+      if (!p || p === b.owner) continue;
+      const d = Math.hypot(b.x - p.x, b.y - p.y);
+      if (d < p.size + b.radius) {
+        p.health -= 15;
+        collided = true;
+        break;
+      }
+    }
+    if (collided) {
+      // safely remove bullet (if still present at index i)
+      if (i < bullets.length && bullets[i] === b) bullets.splice(i, 1);
+    }
+  }
+
+  // handle plane deaths after collision pass to avoid index issues
+  for (let i = planes.length - 1; i >= 0; i--) {
+    const p = planes[i];
+    if (!p) continue;
+    if (p.health <= 0) {
+      const wasPlayer = p.isPlayer;
+      planes.splice(i, 1);
+      if (wasPlayer) {
+        // respawn as AI after short delay
+        setTimeout(() => spawnAI({ color:'#f66' }), 900);
+      }
+    }
+  }
+
+  // render
+  ctx.clearRect(0,0,canvas.width,canvas.height);
+
+  // subtle grid
+  ctx.strokeStyle = '#062';
+  ctx.lineWidth = 1;
+  for (let x = 0; x < canvas.width; x += 60) { ctx.beginPath(); ctx.moveTo(x,0); ctx.lineTo(x,canvas.height); ctx.stroke(); }
+  for (let y = 0; y < canvas.height; y += 60) { ctx.beginPath(); ctx.moveTo(0,y); ctx.lineTo(canvas.width,y); ctx.stroke(); }
+
+  // draw bullets then planes
+  for (const b of bullets) b.draw(ctx);
+  for (const p of planes) p.draw(ctx);
+
+  // HUD cooldown bars for players
+  let hudY = canvas.height - 30;
+  const players = planes.filter(pl => pl.isPlayer);
+  for (let i = 0; i < players.length; i++) {
+    const pl = players[i];
+    const cd = clamp((now() - pl.lastShotAt) / pl.shootCooldownMs, 0, 1);
+    ctx.fillStyle = '#333';
+    ctx.fillRect(20 + i*220, hudY, 180, 14);
+    ctx.fillStyle = '#44f';
+    ctx.fillRect(20 + i*220, hudY, 180 * cd, 14);
+    ctx.fillStyle = '#fff';
+    ctx.font = '12px monospace';
+    ctx.fillText('Player ' + (i+1) + (pl.canShoot() ? ' (Ready)' : ' (CD)'), 20 + i*220, hudY - 6);
+  }
+
+  // debug info
+  debugEl.textContent = `Planes: ${planes.length}  Bullets: ${bullets.length}`;
+
+  requestAnimationFrame(gameLoop);
+}
+
+/* initialize join window */
+joinStart = now();
+joinCountdownEl.textContent = Math.ceil(JOIN_WINDOW_MS / 1000);
+requestAnimationFrame(gameLoop);
+
+/* public API for integration */
+window.Dogfight = Object.freeze({
+  planes, bullets, spawnAI, tryJoin, Plane, Bullet
+});
+</script>
+</body>
+</html>
